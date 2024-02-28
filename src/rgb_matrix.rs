@@ -124,53 +124,24 @@ impl RGBMatrix {
         mut config: RGBMatrixConfig,
         requested_inputs: u32,
     ) -> Result<(Self, Box<Canvas>), MatrixCreationError> {
-        // Check if we can access the memory before doing anything else.
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/mem")
-            .map_err(|_| MatrixCreationError::MemoryAccessError)?;
+        // Check prerequisites before proceeding
+        Self::check_prerequisites(&config)?;
 
-        let chip = if let Some(chip) = config.pi_chip {
-            chip
-        } else {
-            PiChip::determine().ok_or(MatrixCreationError::ChipDeterminationError)?
-        };
+        // Determine the chip type
+        let chip = Self::determine_chip(&config)?;
 
-        let max_parallel = config.hardware_mapping.max_parallel_chains();
-        if config.parallel > max_parallel {
-            return Err(MatrixCreationError::TooManyParallelChains(max_parallel));
-        }
-
-        let pixel_designator = PixelDesignator::new(&config.hardware_mapping, config.led_sequence);
-        let width = config.cols * config.chain_length;
-        let height = config.rows * config.parallel;
-        let mut shared_mapper = PixelDesignatorMap::new(pixel_designator, width, height, &config);
+        // Create the shared mapper.
+        let (pixel_designator, mut shared_mapper) = Self::create_shared_mapper(&config);
 
         // Apply the mapping for the panels first.
-        if let Some(mapper_type) = config.multiplexing.as_ref() {
-            let mut mapper = mapper_type.create();
-            mapper.edit_rows_cols(&mut config.rows, &mut config.cols);
-            let mapper = MultiplexMapperWrapper(mapper);
-            shared_mapper =
-                Self::apply_pixel_mapper(shared_mapper, mapper, &config, pixel_designator);
-        }
+        shared_mapper =
+            Self::apply_panel_multiplexing_mapping(shared_mapper, &mut config, pixel_designator);
 
         // Apply higher level mappers that might arrange panels.
-        let pixelmappers = config.pixelmapper.clone();
-        for mapper_type in pixelmappers {
-            let mapper: NamedPixelMapperWrapper =
-                NamedPixelMapperWrapper(mapper_type.create(config.chain_length, config.parallel));
-            shared_mapper =
-                Self::apply_pixel_mapper(shared_mapper, mapper, &config, pixel_designator);
-        }
+        shared_mapper = Self::apply_higher_level_mappers(shared_mapper, &config, pixel_designator);
 
-        let dither_start_bits = match config.dither_bits {
-            0 => [0, 0, 0, 0],
-            1 => [0, 1, 0, 1],
-            2 => [0, 1, 2, 2],
-            _ => return Err(MatrixCreationError::InvalidDitherBits(config.dither_bits)),
-        };
+        // Set up dither bits
+        let dither_start_bits = Self::dither_start_bits(&config)?;
 
         // Create two canvases, one for the display update thread and one for the user to modify. They will be
         // swapped out after each frame.
@@ -300,6 +271,90 @@ impl RGBMatrix {
         };
 
         Ok((rgbmatrix, canvas))
+    }
+
+    fn check_prerequisites(config: &RGBMatrixConfig) -> Result<(), MatrixCreationError> {
+        // Check memory access
+        Self::check_memory_access()?;
+
+        // Check parallel chains
+        Self::check_parallel_chains(config)?;
+
+        Ok(())
+    }
+
+    fn check_memory_access() -> Result<(), MatrixCreationError> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/mem")
+            .map_err(|_| MatrixCreationError::MemoryAccessError)?;
+        Ok(())
+    }
+
+    fn check_parallel_chains(config: &RGBMatrixConfig) -> Result<(), MatrixCreationError> {
+        let max_parallel = config.hardware_mapping.max_parallel_chains();
+        if config.parallel > max_parallel {
+            return Err(MatrixCreationError::TooManyParallelChains(max_parallel));
+        }
+        Ok(())
+    }
+
+    fn determine_chip(config: &RGBMatrixConfig) -> Result<PiChip, MatrixCreationError> {
+        if let Some(chip) = config.pi_chip {
+            Ok(chip)
+        } else {
+            PiChip::determine().ok_or(MatrixCreationError::ChipDeterminationError)
+        }
+    }
+
+    fn create_shared_mapper(config: &RGBMatrixConfig) -> (PixelDesignator, PixelDesignatorMap) {
+        let pixel_designator = PixelDesignator::new(&config.hardware_mapping, config.led_sequence);
+        let width = config.cols * config.chain_length;
+        let height = config.rows * config.parallel;
+        (
+            pixel_designator,
+            PixelDesignatorMap::new(pixel_designator, width, height, &config),
+        )
+    }
+
+    fn apply_panel_multiplexing_mapping(
+        shared_mapper: PixelDesignatorMap,
+        config: &mut RGBMatrixConfig,
+        pixel_designator: PixelDesignator,
+    ) -> PixelDesignatorMap {
+        if let Some(mapper_type) = config.multiplexing.as_ref() {
+            let mut mapper = mapper_type.create();
+            mapper.edit_rows_cols(&mut config.rows, &mut config.cols);
+            let mapper = MultiplexMapperWrapper(mapper);
+            return Self::apply_pixel_mapper(shared_mapper, mapper, &config, pixel_designator);
+        }
+        shared_mapper
+    }
+
+    fn apply_higher_level_mappers(
+        shared_mapper: PixelDesignatorMap,
+        config: &RGBMatrixConfig,
+        pixel_designator: PixelDesignator,
+    ) -> PixelDesignatorMap {
+        let pixelmappers = config.pixelmapper.clone();
+        let mut updated_mapper = shared_mapper;
+        for mapper_type in pixelmappers {
+            let mapper: NamedPixelMapperWrapper =
+                NamedPixelMapperWrapper(mapper_type.create(config.chain_length, config.parallel));
+            updated_mapper =
+                Self::apply_pixel_mapper(updated_mapper, mapper, config, pixel_designator);
+        }
+        updated_mapper
+    }
+
+    fn dither_start_bits(config: &RGBMatrixConfig) -> Result<[usize; 4], MatrixCreationError> {
+        match config.dither_bits {
+            0 => Ok([0, 0, 0, 0]),
+            1 => Ok([0, 1, 0, 1]),
+            2 => Ok([0, 1, 2, 2]),
+            _ => Err(MatrixCreationError::InvalidDitherBits(config.dither_bits)),
+        }
     }
 
     fn apply_pixel_mapper(
