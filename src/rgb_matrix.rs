@@ -145,16 +145,15 @@ impl RGBMatrix {
 
         // Create two canvases, one for the display update thread and one for the user to modify. They will be
         // swapped out after each frame.
-        let canvas = Box::new(Canvas::new(&config, shared_mapper));
-        let mut thread_canvas = canvas.clone();
-
-        let (canvas_to_thread_sender, canvas_to_thread_receiver) = sync_channel::<Box<Canvas>>(0);
-        let (canvas_from_thread_sender, canvas_from_thread_receiver) =
-            sync_channel::<Box<Canvas>>(1);
-        let (shutdown_sender, shutdown_receiver) = channel::<()>();
-        let (input_sender, input_receiver) = channel::<u32>();
-        let (thread_start_result_sender, thread_start_result_receiver) =
-            channel::<Result<u32, MatrixCreationError>>();
+        let (
+            canvas,
+            mut thread_canvas,
+            (canvas_to_thread_sender, canvas_to_thread_receiver),
+            (canvas_from_thread_sender, canvas_from_thread_receiver),
+            (shutdown_sender, shutdown_receiver),
+            (input_sender, input_receiver),
+            (thread_start_result_sender, thread_start_result_receiver),
+        ) = Self::create_canvases_and_channels(shared_mapper, &config);
 
         let thread_handle = spawn(move || {
             initialize_update_thread(&chip);
@@ -355,6 +354,43 @@ impl RGBMatrix {
             2 => Ok([0, 1, 2, 2]),
             _ => Err(MatrixCreationError::InvalidDitherBits(config.dither_bits)),
         }
+    }
+
+    fn create_canvases_and_channels(
+        shared_mapper: PixelDesignatorMap,
+        config: &RGBMatrixConfig,
+    ) -> (
+        Box<Canvas>,
+        Box<Canvas>,
+        (SyncSender<Box<Canvas>>, Receiver<Box<Canvas>>),
+        (SyncSender<Box<Canvas>>, Receiver<Box<Canvas>>),
+        (Sender<()>, Receiver<()>),
+        (Sender<u32>, Receiver<u32>),
+        (
+            Sender<Result<u32, MatrixCreationError>>,
+            Receiver<Result<u32, MatrixCreationError>>,
+        ),
+    ) {
+        let canvas = Box::new(Canvas::new(config, shared_mapper));
+        let thread_canvas = canvas.clone();
+
+        let (canvas_to_thread_sender, canvas_to_thread_receiver) = sync_channel::<Box<Canvas>>(0);
+        let (canvas_from_thread_sender, canvas_from_thread_receiver) =
+            sync_channel::<Box<Canvas>>(1);
+        let (shutdown_sender, shutdown_receiver) = channel::<()>();
+        let (input_sender, input_receiver) = channel::<u32>();
+        let (thread_start_result_sender, thread_start_result_receiver) =
+            channel::<Result<u32, MatrixCreationError>>();
+
+        (
+            canvas,
+            thread_canvas,
+            (canvas_to_thread_sender, canvas_to_thread_receiver),
+            (canvas_from_thread_sender, canvas_from_thread_receiver),
+            (shutdown_sender, shutdown_receiver),
+            (input_sender, input_receiver),
+            (thread_start_result_sender, thread_start_result_receiver),
+        )
     }
 
     fn apply_pixel_mapper(
