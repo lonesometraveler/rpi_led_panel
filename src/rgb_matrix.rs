@@ -132,7 +132,6 @@ impl RGBMatrix {
     pub fn new(
         mut config: RGBMatrixConfig,
         requested_inputs: u32,
-        custom_mapper: Option<impl PixelMapper>,
     ) -> Result<(Self, Box<Canvas>), MatrixCreationError> {
         // Check prerequisites before proceeding
         Self::check_prerequisites(&config)?;
@@ -149,12 +148,6 @@ impl RGBMatrix {
 
         // Apply higher level mappers that might arrange panels.
         shared_mapper = Self::apply_higher_level_mappers(shared_mapper, &config, pixel_designator);
-
-        // Apply custom mapper if available
-        if let Some(mapper) = custom_mapper {
-            shared_mapper =
-                Self::apply_custom_mappers(mapper, shared_mapper, &config, pixel_designator);
-        }
 
         // Set up dither bits
         let dither_start_bits = Self::dither_start_bits(&config)?;
@@ -390,17 +383,6 @@ impl RGBMatrix {
             updated_mapper =
                 Self::apply_pixel_mapper(updated_mapper, mapper, config, pixel_designator);
         }
-        updated_mapper
-    }
-
-    fn apply_custom_mappers(
-        mapper: impl PixelMapper,
-        shared_mapper: PixelDesignatorMap,
-        config: &RGBMatrixConfig,
-        pixel_designator: PixelDesignator,
-    ) -> PixelDesignatorMap {
-        let mut updated_mapper = shared_mapper;
-        updated_mapper = Self::apply_pixel_mapper(updated_mapper, mapper, config, pixel_designator);
         updated_mapper
     }
 
