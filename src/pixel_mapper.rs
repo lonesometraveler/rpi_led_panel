@@ -4,7 +4,7 @@ use crate::{multiplex_mapper::MultiplexMapper, named_pixel_mapper::NamedPixelMap
 /// layout. If you have an implementation of a PixelMapper, you can give it
 /// to the RGBMatrix::apply_pixel_mapper(), which then presents you with a canvas
 /// that has the new "visible width" and "visible height".
-pub trait PixelMapper {
+pub(crate) trait PixelMapper {
     /// Given a underlying matrix (width, height), returns the
     /// visible (width, height) after the mapping.
     /// E.g. a 90 degree rotation might map matrix=(64, 32) -> visible=(32, 64)
