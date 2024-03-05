@@ -4,7 +4,8 @@ use std::{
     fs::{write, OpenOptions},
     mem::replace,
     sync::mpsc::{
-        channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError,
+        channel, sync_channel, Receiver, RecvTimeoutError, SendError, Sender, SyncSender,
+        TryRecvError,
     },
     thread::{spawn, JoinHandle},
     time::Duration,
@@ -95,6 +96,14 @@ impl Display for MatrixCreationError {
     }
 }
 
+/// The result of a canvas transfer
+#[derive(Debug)]
+enum CanvasTransferResult {
+    Success,
+    Disconnected,
+    Timeout,
+}
+
 pub struct RGBMatrix {
     /// The join handle of the update thread.
     thread_handle: Option<JoinHandle<()>>,
@@ -123,6 +132,7 @@ impl RGBMatrix {
     pub fn new(
         mut config: RGBMatrixConfig,
         requested_inputs: u32,
+        custom_mapper: Option<impl PixelMapper>,
     ) -> Result<(Self, Box<Canvas>), MatrixCreationError> {
         // Check prerequisites before proceeding
         Self::check_prerequisites(&config)?;
@@ -140,20 +150,28 @@ impl RGBMatrix {
         // Apply higher level mappers that might arrange panels.
         shared_mapper = Self::apply_higher_level_mappers(shared_mapper, &config, pixel_designator);
 
+        // Apply custom mapper if available
+        if let Some(mapper) = custom_mapper {
+            shared_mapper =
+                Self::apply_custom_mappers(mapper, shared_mapper, &config, pixel_designator);
+        }
+
         // Set up dither bits
         let dither_start_bits = Self::dither_start_bits(&config)?;
 
         // Create two canvases, one for the display update thread and one for the user to modify. They will be
         // swapped out after each frame.
-        let (
-            canvas,
-            mut thread_canvas,
-            (canvas_to_thread_sender, canvas_to_thread_receiver),
-            (canvas_from_thread_sender, canvas_from_thread_receiver),
-            (shutdown_sender, shutdown_receiver),
-            (input_sender, input_receiver),
-            (thread_start_result_sender, thread_start_result_receiver),
-        ) = Self::create_canvases_and_channels(shared_mapper, &config);
+        let canvas = Box::new(Canvas::new(&config, shared_mapper));
+        let mut thread_canvas = canvas.clone();
+
+        let (canvas_to_thread_sender, canvas_to_thread_receiver) = sync_channel::<Box<Canvas>>(0);
+        let (canvas_from_thread_sender, canvas_from_thread_receiver) =
+            sync_channel::<Box<Canvas>>(1);
+
+        let (shutdown_sender, shutdown_receiver) = channel::<()>();
+        let (input_sender, input_receiver) = channel::<u32>();
+        let (thread_start_result_sender, thread_start_result_receiver) =
+            channel::<Result<u32, MatrixCreationError>>();
 
         let thread_handle = spawn(move || {
             initialize_update_thread(&chip);
@@ -198,32 +216,27 @@ impl RGBMatrix {
                     if shutdown_receiver.try_recv() != Err(TryRecvError::Empty) {
                         break 'thread;
                     }
+
                     // Read input bits and send them if they have changed.
-                    let new_inputs = gpio.read();
-                    if new_inputs != last_gpio_inputs {
-                        match input_sender.send(new_inputs) {
-                            Ok(()) => {}
-                            Err(_) => {
-                                break 'thread;
-                            }
-                        }
-                        last_gpio_inputs = new_inputs;
+                    if Self::handle_gpio_input(
+                        &mut gpio,
+                        &mut last_gpio_inputs,
+                        input_sender.clone(),
+                    )
+                    .is_err()
+                    {
+                        break 'thread;
                     }
+
                     // Wait for a swap canvas.
-                    match canvas_to_thread_receiver.recv_timeout(Duration::from_millis(1)) {
-                        Ok(new_canvas) => {
-                            let old_canvas = replace(&mut thread_canvas, new_canvas);
-                            match canvas_from_thread_sender.send(old_canvas) {
-                                Ok(_) => break,
-                                Err(_) => {
-                                    break 'thread;
-                                }
-                            };
-                        }
-                        Err(RecvTimeoutError::Disconnected) => {
-                            break 'thread;
-                        }
-                        Err(RecvTimeoutError::Timeout) => {}
+                    match Self::handle_canvas_transfer(
+                        &mut thread_canvas,
+                        &canvas_to_thread_receiver,
+                        &canvas_from_thread_sender,
+                    ) {
+                        CanvasTransferResult::Success => break,
+                        CanvasTransferResult::Disconnected => break 'thread,
+                        CanvasTransferResult::Timeout => (),
                     }
                 }
 
@@ -234,6 +247,7 @@ impl RGBMatrix {
                     dither_start_bits[dither_low_bit_sequence % dither_start_bits.len()],
                     color_clk_mask,
                 );
+
                 dither_low_bit_sequence += 1;
 
                 // Sleep for the rest of the frame.
@@ -272,13 +286,45 @@ impl RGBMatrix {
         Ok((rgbmatrix, canvas))
     }
 
+    fn handle_canvas_transfer(
+        thread_canvas: &mut Box<Canvas>,
+        canvas_to_thread_receiver: &Receiver<Box<Canvas>>,
+        canvas_from_thread_sender: &SyncSender<Box<Canvas>>,
+    ) -> CanvasTransferResult {
+        match canvas_to_thread_receiver.recv_timeout(Duration::from_millis(1)) {
+            Ok(new_canvas) => {
+                let old_canvas = replace(thread_canvas, new_canvas);
+                match canvas_from_thread_sender.send(old_canvas) {
+                    Ok(_) => CanvasTransferResult::Success,
+                    Err(_) => CanvasTransferResult::Disconnected,
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => CanvasTransferResult::Disconnected,
+            Err(RecvTimeoutError::Timeout) => CanvasTransferResult::Timeout,
+        }
+    }
+
+    fn handle_gpio_input(
+        gpio: &mut Gpio,
+        last_gpio_inputs: &mut u32,
+        input_sender: Sender<u32>,
+    ) -> Result<(), SendError<u32>> {
+        let new_inputs = gpio.read();
+        if &new_inputs != last_gpio_inputs {
+            match input_sender.send(new_inputs) {
+                Ok(()) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+            *last_gpio_inputs = new_inputs;
+        }
+        Ok(())
+    }
+
     fn check_prerequisites(config: &RGBMatrixConfig) -> Result<(), MatrixCreationError> {
-        // Check memory access
         Self::check_memory_access()?;
-
-        // Check parallel chains
         Self::check_parallel_chains(config)?;
-
         Ok(())
     }
 
@@ -313,7 +359,7 @@ impl RGBMatrix {
         let height = config.rows * config.parallel;
         (
             pixel_designator,
-            PixelDesignatorMap::new(pixel_designator, width, height, &config),
+            PixelDesignatorMap::new(pixel_designator, width, height, config),
         )
     }
 
@@ -326,7 +372,7 @@ impl RGBMatrix {
             let mut mapper = mapper_type.create();
             mapper.edit_rows_cols(&mut config.rows, &mut config.cols);
             let mapper = MultiplexMapperWrapper(mapper);
-            return Self::apply_pixel_mapper(shared_mapper, mapper, &config, pixel_designator);
+            return Self::apply_pixel_mapper(shared_mapper, mapper, config, pixel_designator);
         }
         shared_mapper
     }
@@ -347,6 +393,17 @@ impl RGBMatrix {
         updated_mapper
     }
 
+    fn apply_custom_mappers(
+        mapper: impl PixelMapper,
+        shared_mapper: PixelDesignatorMap,
+        config: &RGBMatrixConfig,
+        pixel_designator: PixelDesignator,
+    ) -> PixelDesignatorMap {
+        let mut updated_mapper = shared_mapper;
+        updated_mapper = Self::apply_pixel_mapper(updated_mapper, mapper, config, pixel_designator);
+        updated_mapper
+    }
+
     fn dither_start_bits(config: &RGBMatrixConfig) -> Result<[usize; 4], MatrixCreationError> {
         match config.dither_bits {
             0 => Ok([0, 0, 0, 0]),
@@ -354,43 +411,6 @@ impl RGBMatrix {
             2 => Ok([0, 1, 2, 2]),
             _ => Err(MatrixCreationError::InvalidDitherBits(config.dither_bits)),
         }
-    }
-
-    fn create_canvases_and_channels(
-        shared_mapper: PixelDesignatorMap,
-        config: &RGBMatrixConfig,
-    ) -> (
-        Box<Canvas>,
-        Box<Canvas>,
-        (SyncSender<Box<Canvas>>, Receiver<Box<Canvas>>),
-        (SyncSender<Box<Canvas>>, Receiver<Box<Canvas>>),
-        (Sender<()>, Receiver<()>),
-        (Sender<u32>, Receiver<u32>),
-        (
-            Sender<Result<u32, MatrixCreationError>>,
-            Receiver<Result<u32, MatrixCreationError>>,
-        ),
-    ) {
-        let canvas = Box::new(Canvas::new(config, shared_mapper));
-        let thread_canvas = canvas.clone();
-
-        let (canvas_to_thread_sender, canvas_to_thread_receiver) = sync_channel::<Box<Canvas>>(0);
-        let (canvas_from_thread_sender, canvas_from_thread_receiver) =
-            sync_channel::<Box<Canvas>>(1);
-        let (shutdown_sender, shutdown_receiver) = channel::<()>();
-        let (input_sender, input_receiver) = channel::<u32>();
-        let (thread_start_result_sender, thread_start_result_receiver) =
-            channel::<Result<u32, MatrixCreationError>>();
-
-        (
-            canvas,
-            thread_canvas,
-            (canvas_to_thread_sender, canvas_to_thread_receiver),
-            (canvas_from_thread_sender, canvas_from_thread_receiver),
-            (shutdown_sender, shutdown_receiver),
-            (input_sender, input_receiver),
-            (thread_start_result_sender, thread_start_result_receiver),
-        )
     }
 
     fn apply_pixel_mapper(
