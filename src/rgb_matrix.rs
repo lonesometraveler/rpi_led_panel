@@ -304,12 +304,7 @@ impl RGBMatrix {
     ) -> Result<(), SendError<u32>> {
         let new_inputs = gpio.read();
         if &new_inputs != last_gpio_inputs {
-            match input_sender.send(new_inputs) {
-                Ok(()) => {}
-                Err(e) => {
-                    return Err(e);
-                }
-            }
+            input_sender.send(new_inputs)?;
             *last_gpio_inputs = new_inputs;
         }
         Ok(())
@@ -317,8 +312,7 @@ impl RGBMatrix {
 
     fn check_prerequisites(config: &RGBMatrixConfig) -> Result<(), MatrixCreationError> {
         Self::check_memory_access()?;
-        Self::check_parallel_chains(config)?;
-        Ok(())
+        Self::check_parallel_chains(config)
     }
 
     fn check_memory_access() -> Result<(), MatrixCreationError> {
